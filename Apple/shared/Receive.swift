@@ -125,6 +125,11 @@ extension Transfer {
 
             self.delegate?.setProgress(1, animated: true, hidden: false)
 
+            // Close before moving to the next file rather than waiting for ARC: a folder
+            // transfer opens one of these per file, and they were all held until the whole
+            // loop finished.
+            try? outHandle.close()
+
             // tell sending end we're finished
             try await tcp.write(data: ONE)
 

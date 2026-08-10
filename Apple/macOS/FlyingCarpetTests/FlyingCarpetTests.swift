@@ -7,6 +7,7 @@
 
 import XCTest
 import CryptoKit
+import Network
 @testable import FlyingCarpet
 
 final class FlyingCarpetTests: XCTestCase {
@@ -425,5 +426,150 @@ final class HashFileTests: XCTestCase {
         XCTAssertEqual(try hashFile(file: handle), expected)
         try handle.seekToEnd()
         XCTAssertEqual(try hashFile(file: handle), expected)
+    }
+}
+
+// A Noise transport must hold at most one decrypted record, however much a caller asks for.
+// The buffer used to be a single Data appended to until it reached the requested length and
+// then drained from the front; draining the front of a Data does not reclaim the front of its
+// storage, so on a receiver the footprint tracked bytes received rather than bytes in flight.
+// An iPad 9 (1850 MiB per-process limit) was killed by jetsam about 1.1 GB into a 3.75 GiB
+// transfer, in one case taking SpringBoard down with it (#142).
+//
+// Noise.swift lives in Apple/shared and compiles into both apps, so running these on macOS
+// covers the iOS receiver, which is the side that failed.
+final class NoiseConnectionBufferTests: XCTestCase {
+
+    // Generates a valid Noise record stream on demand rather than holding one in memory, so
+    // the footprint measured below belongs to the code under test and not to the fixture.
+    private final class GeneratingConnection: TCPConnectionProtocol {
+        private let cipher: NoiseCipherState
+        private let payload: Data
+        private var recordsLeft: Int
+        private var pending = Data()
+        private var pendingPos = 0
+        var beforeRead: (() -> Void)?
+
+        init(cipher: NoiseCipherState, payload: Data, records: Int) {
+            self.cipher = cipher
+            self.payload = payload
+            self.recordsLeft = records
+        }
+
+        var connection: NWConnection {
+            fatalError("GeneratingConnection has no NWConnection; these tests never reach one")
+        }
+
+        func write(data: Data) async throws {}
+        func disconnect() {}
+        func forceDisconnect() {}
+
+        func receiveNBytes(n: Int) async throws -> Data {
+            beforeRead?()
+            var out = Data(capacity: n)
+            while out.count < n {
+                if pendingPos >= pending.count {
+                    guard recordsLeft > 0 else { throw TransferError.TCPReadError }
+                    recordsLeft -= 1
+                    let record = try cipher.encrypt(ad: Data(), plaintext: payload)
+                    var framed = Data(capacity: record.count + 2)
+                    framed.append(UInt8((record.count >> 8) & 0xff))
+                    framed.append(UInt8(record.count & 0xff))
+                    framed.append(record)
+                    pending = framed
+                    pendingPos = 0
+                }
+                let take = min(pending.count - pendingPos, n - out.count)
+                out.append(pending[pendingPos ..< (pendingPos + take)])
+                pendingPos += take
+            }
+            return out
+        }
+    }
+
+    private func cipherPair(_ password: String) throws -> (NoiseCipherState, NoiseCipherState) {
+        let psk = derivePsk(password)
+        let initHS = try NoiseHandshakeState(role: .initiator, psk: psk)
+        let respHS = try NoiseHandshakeState(role: .responder, psk: psk)
+        _ = try respHS.readMessage(initHS.writeMessage())
+        _ = try initHS.readMessage(respHS.writeMessage())
+        let (initSend, _) = initHS.split()
+        let (_, respRecv) = respHS.split()
+        return (initSend, respRecv)
+    }
+
+    private func makeConnection(streaming bytes: Int) throws -> (NoiseConnection, GeneratingConnection) {
+        let (send, recv) = try cipherPair("bounded buffer")
+        let payload = Data(repeating: 0xA5, count: NOISE_MAX_PLAINTEXT)
+        let generator = GeneratingConnection(
+            cipher: send, payload: payload, records: bytes / NOISE_MAX_PLAINTEXT + 2
+        )
+        return (NoiseConnection(inner: generator, sendCipher: send, recvCipher: recv), generator)
+    }
+
+    // phys_footprint is the figure jetsam reads, and what the #142 report quotes as rpages.
+    private func physFootprint() -> UInt64 {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? info.phys_footprint : 0
+    }
+
+    // Deterministic form. Samples the buffer where it is largest — just before each frame is
+    // pulled — and requires it to stay within one record whatever the caller asked for. Under
+    // the old buffer a single 5 MB read grew it to the full 5 MB before draining.
+    func testBufferNeverExceedsOneRecord() async throws {
+        let chunks = 8
+        let (connection, generator) = try makeConnection(streaming: CHUNK_SIZE * chunks)
+
+        var peak = 0
+        generator.beforeRead = { [weak connection] in
+            if let connection { peak = max(peak, connection.bufferedByteCount) }
+        }
+
+        var received = 0
+        for _ in 0 ..< chunks {
+            let chunk = try await connection.receiveNBytes(n: CHUNK_SIZE)
+            XCTAssertEqual(chunk.count, CHUNK_SIZE)
+            received += chunk.count
+            peak = max(peak, connection.bufferedByteCount)
+        }
+
+        XCTAssertEqual(received, CHUNK_SIZE * chunks)
+        XCTAssertLessThanOrEqual(
+            peak, NOISE_MAX_MESSAGE,
+            "buffered \(peak) bytes; a Noise transport must never carry more than one record"
+        )
+    }
+
+    // Symptom form. Streams well past where the iPad died and requires the process footprint
+    // to stay flat. Touches no internals, so it runs against the pre-fix buffer too — this is
+    // the one to check out the old Noise.swift and run if the mechanism ever needs confirming.
+    func testFootprintStaysFlatAcrossALargeTransfer() async throws {
+        let chunks = 64                       // 320 MB
+        let (connection, _) = try makeConnection(streaming: CHUNK_SIZE * chunks)
+
+        // one chunk first, so one-off allocations land before the baseline is taken
+        _ = try await connection.receiveNBytes(n: CHUNK_SIZE)
+        let baseline = physFootprint()
+        try XCTSkipIf(baseline == 0, "task_info(TASK_VM_INFO) unavailable")
+
+        for _ in 1 ..< chunks {
+            _ = try await connection.receiveNBytes(n: CHUNK_SIZE)
+        }
+
+        let growth = max(physFootprint(), baseline) - baseline
+        // Deliberately loose: a few chunks of transient allocation is fine, growth
+        // proportional to the volume streamed is not.
+        XCTAssertLessThan(
+            growth, 64 << 20,
+            "footprint grew \(growth >> 20) MB while streaming \(CHUNK_SIZE * chunks >> 20) MB"
+        )
     }
 }

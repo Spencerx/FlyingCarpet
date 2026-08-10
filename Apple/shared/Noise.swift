@@ -366,7 +366,25 @@ final class NoiseConnection: TCPConnectionProtocol {
     private let inner: any TCPConnectionProtocol
     private let sendCipher: NoiseCipherState
     private let recvCipher: NoiseCipherState
-    private var plainBuffer = Data()
+
+    // One decrypted record and how much of it has been handed out — never an accumulator that
+    // is appended to and consumed from the front. A record is capped at 65535 bytes by the
+    // framing, so this holds a bounded amount however large the transfer is.
+    //
+    // It used to be a single Data built with append() and drained with removeFirst(). The
+    // contents stayed small, but the buffer had to grow to the caller's requested length before
+    // being drained, and draining from the front of a Data does not reclaim the front of its
+    // storage. On a receiver that meant the footprint tracked the bytes received rather than
+    // the bytes in flight: an iPad at the 1850 MiB per-process limit was killed by jetsam
+    // around 1.1 GB into a 3.75 GiB transfer (#142). Rust (read_plain/read_plain_pos in
+    // core/src/noise.rs) and Kotlin (NoiseInputStream) always had this shape; Swift was the
+    // one that diverged, which is why only the iOS receiver failed.
+    private var plain = Data()
+    private var plainPos = 0
+
+    // Bytes of the current record not yet handed to a caller. Exposed for the test that pins
+    // the bound above (see NoiseConnectionBufferTests); nothing in the app reads it.
+    var bufferedByteCount: Int { plain.count - plainPos }
 
     init(inner: any TCPConnectionProtocol, sendCipher: NoiseCipherState, recvCipher: NoiseCipherState) {
         self.inner = inner
@@ -391,14 +409,27 @@ final class NoiseConnection: TCPConnectionProtocol {
     }
 
     func receiveNBytes(n: Int) async throws -> Data {
-        while plainBuffer.count < n {
-            let record = try await readNoiseFrame(inner)
-            let plain = try recvCipher.decrypt(ad: Data(), ciphertext: record)
-            plainBuffer.append(plain)
+        var out = Data(capacity: n)
+        while out.count < n {
+            if plainPos >= plain.count {
+                // Replace the record rather than appending to it, so the previous one is
+                // released and the allocation stays at one record's worth.
+                let record = try await readNoiseFrame(inner)
+                plain = try recvCipher.decrypt(ad: Data(), ciphertext: record)
+                plainPos = 0
+                // A well-formed peer never sends an empty record; without this a stream of
+                // them would spin here forever instead of failing.
+                if plain.isEmpty {
+                    throw NoiseError(description: "Empty Noise record")
+                }
+            }
+            let take = min(plain.count - plainPos, n - out.count)
+            // plain comes straight from ChaChaPoly.open, so its indices start at zero and
+            // plainPos is a valid offset into it.
+            out.append(plain[plainPos ..< (plainPos + take)])
+            plainPos += take
         }
-        let result = Data(plainBuffer.prefix(n))
-        plainBuffer.removeFirst(n)
-        return result
+        return out
     }
 
     func disconnect() { inner.disconnect() }
