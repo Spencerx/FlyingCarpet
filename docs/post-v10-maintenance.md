@@ -412,3 +412,106 @@ change but does not retroactively help published versions.
 
 References: `docs.signpath.io/trusted-build-systems/github`, `docs.signpath.io/origin-verification`,
 `signpath.org/terms.html`.
+
+---
+
+## 7. Android asks for location on every version, including those that don't need it
+
+Found during 10.0.3 device testing, 2026-08-05, after `neverForLocation` landed on
+`BLUETOOTH_SCAN` (commit `efb1927`). That flag removed the last reason API 31+ needs location
+for Bluetooth, but nothing downstream was updated to match.
+
+### Where it stands
+
+`AndroidManifest.xml` declares `ACCESS_FINE_LOCATION` and `ACCESS_COARSE_LOCATION` with no
+`maxSdkVersion`, and both branches of `permissions` (`MainActivity.kt:725`) include fine
+location, so every launch on every supported version asks for it as part of the Bluetooth
+bundle. `checkForBluetoothPermissions()` (`:746`) then treats it as mandatory for Bluetooth to
+work at all, which is no longer true above API 30.
+
+### Target
+
+Location requested only where it is genuinely required:
+
+| API | Needed for | Source |
+|---|---|---|
+| 29–30 | BLE scanning and hosting a hotspot | `neverForLocation` doesn't exist below 31 |
+| 31–32 | Hosting only | `startLocalOnlyHotspot()`; `NEARBY_WIFI_DEVICES` arrives at 33 |
+| 33+ | Nothing | — |
+
+### Changes
+
+1. Add `android:maxSdkVersion="32"` to `ACCESS_FINE_LOCATION` in the manifest, and the same to
+   `ACCESS_COARSE_LOCATION`. Keep coarse rather than deleting it — see the risk below.
+2. Drop `ACCESS_FINE_LOCATION` from the `SDK_INT >= S` branch of `permissions`
+   (`MainActivity.kt:728`), leaving the pre-31 branch untouched.
+3. Delete the commented-out `ACCESS_COARSE_LOCATION` at `MainActivity.kt:727`. Dead since it
+   was commented out.
+4. Leave `startHotspot()` alone. `MainViewModel.kt:628` already picks fine location below 33 and
+   `NEARBY_WIFI_DEVICES` at 33+, and requests it on demand, so it becomes the sole requester on
+   31–32 and hosting keeps working. The prompt moves from launch to the first hotspot, which is
+   the visible behavior change.
+
+An earlier reading of this called for a three-way split of the request array. It doesn't: the
+on-demand request in `startHotspot()` already covers 31–32.
+
+### The risk to design around
+
+Android 12 requires that a fine-location request also declare and request coarse location in the
+same call, or the dialog is refused. After change 2, the only fine-location request on 31–32 is
+`startHotspot()`'s single-permission `launch(requiredPermission)` (`MainViewModel.kt:637`).
+
+That may already be non-conforming today and working anyway, because the permission is normally
+already granted from the launch bundle, which masks it. Verify on an emulator before deciding
+whether to widen the call to request both together. Hosting working on a current device is not
+evidence either way.
+
+### Testing
+
+An Android 12 emulator (API 31 or 32) is the one that matters, for the request path and the
+coarse/fine pairing above. The Samsung A03s on 13 confirms no location prompt appears at all and
+that hosting still works through `NEARBY_WIFI_DEVICES`. An API 29 or 30 emulator confirms the old
+path is untouched. Emulators can't host a real hotspot, so `startLocalOnlyHotspot()` succeeding
+stays a hardware check.
+
+`README.md:74` describes the reasons rather than the versions, so it stays accurate either way,
+but revisit it once behavior matches.
+
+---
+
+## 8. Bluetooth off at launch is unrecoverable without restarting
+
+Found the same day, while removing a capability check that turned out to be unnecessary.
+
+Bluetooth merely being switched off reaches the same failure branch as a device with no BLE
+support, because `openGattServer()` returns null either way. Commit `833a0a4` made the message
+name which one it is, but not the recovery: that branch calls `setBluetoothSwitchEnabled(false)`,
+so the switch listener at `MainActivity.kt:808` that would retry `initializeBluetooth()` can't be
+tapped, and `onResume()` (`:843`) only retries when permissions were the problem. Turning
+Bluetooth on has no path back, which is why the message currently says to restart the app.
+
+### Two fixes, covering different flows
+
+Leave the switch enabled when the failure is the adapter being off rather than absent hardware —
+the distinction the message already draws. This mirrors what #101 did for permission denials and
+makes tapping the switch the recovery. It covers turning Bluetooth on from the quick-settings
+shade, which doesn't stop the activity and so never fires `onResume()`.
+
+Retry in `onResume()` when the adapter is now enabled, alongside the existing permissions check.
+This covers leaving the app to change the setting and coming back. Needs a flag beside
+`bluetoothPermissionsMissing` recording that initialization failed on adapter state, so a
+genuinely incapable device isn't retried on every resume.
+
+Then drop "restart Flying Carpet" from the message in favor of tapping the switch.
+
+### Alternative
+
+A `BluetoothAdapter.ACTION_STATE_CHANGED` receiver handles both flows automatically. The app
+already registers one receiver for bond state (`:824`), so it isn't foreign, but it's more
+lifecycle to get right. Reach for it only if the flag approach gets awkward.
+
+### Testing
+
+Device-only and quick. Launch with Bluetooth off, confirm the message, turn Bluetooth on from the
+shade, tap the switch, confirm a transfer works. Repeat by backgrounding the app instead of
+tapping.
