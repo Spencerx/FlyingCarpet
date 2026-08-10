@@ -184,6 +184,62 @@ final class NoiseConnectionBufferTests: XCTestCase {
             "footprint grew \(growth >> 20) MB while streaming \((CHUNK_SIZE * chunks) >> 20) MB"
         )
     }
+
+    // Device only, and the closest thing to #142 that can be run without the reporter's iPad.
+    //
+    // os_proc_available_memory() is how much the process may still allocate before jetsam kills
+    // it — the exact quantity that ran out on the iPad 9. It reports 0 where nothing is enforcing
+    // a limit, which is what skips this on the simulator, so the volume below scales itself to
+    // whatever device is attached rather than hardcoding the iPad's 1850 MiB.
+    //
+    // Streaming half again as much as the process is allowed to hold means the old buffer, whose
+    // footprint tracked bytes received, could not survive this: it would be killed partway, the
+    // test would die with it, and xcodebuild would report the crash. A bounded buffer does not
+    // care how much goes through it.
+    func testStreamsPastTheProcessMemoryLimitOnDevice() async throws {
+        let headroomAtStart = os_proc_available_memory()
+        try XCTSkipIf(
+            headroomAtStart == 0,
+            "no per-process memory limit here — run on a device, not the simulator"
+        )
+
+        let volume = min(Int(Double(headroomAtStart) * 1.5), 8 << 30)
+        let chunks = max(volume / CHUNK_SIZE, 64)
+        let (connection, _) = try makeConnection(streaming: CHUNK_SIZE * chunks)
+
+        _ = try await connection.receiveNBytes(n: CHUNK_SIZE)
+        let baseline = physFootprint()
+        var worstHeadroom = os_proc_available_memory()
+        print("""
+            jetsam headroom at start: \(headroomAtStart >> 20) MB, \
+            streaming \((CHUNK_SIZE * chunks) >> 20) MB through the receive buffer
+            """)
+
+        for chunk in 1 ..< chunks {
+            _ = try await connection.receiveNBytes(n: CHUNK_SIZE)
+            if chunk % 200 == 0 {
+                worstHeadroom = min(worstHeadroom, os_proc_available_memory())
+                print("""
+                    \((CHUNK_SIZE * chunk) >> 20) MB in: \
+                    footprint \(physFootprint() >> 20) MB, \
+                    headroom \(os_proc_available_memory() >> 20) MB
+                    """)
+            }
+        }
+        worstHeadroom = min(worstHeadroom, os_proc_available_memory())
+
+        // Reaching here at all is most of the result — the old buffer would have been killed.
+        let consumed = headroomAtStart - worstHeadroom
+        XCTAssertLessThan(
+            consumed, 128 << 20,
+            "streaming \((CHUNK_SIZE * chunks) >> 20) MB ate \(consumed >> 20) MB of the \(headroomAtStart >> 20) MB before jetsam"
+        )
+        let growth = max(physFootprint(), baseline) - baseline
+        XCTAssertLessThan(
+            growth, 128 << 20,
+            "footprint grew \(growth >> 20) MB while streaming \((CHUNK_SIZE * chunks) >> 20) MB"
+        )
+    }
 }
 
 // MARK: - #141, QR display layout
