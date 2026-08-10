@@ -188,6 +188,18 @@ class QRDisplayViewController: UIViewController {
         imageView.contentMode = .scaleAspectFit
         // keep the modules crisp if the image view is larger than the generated image
         imageView.layer.magnificationFilter = .nearest
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+
+        // The code sits in a container instead of filling the stack directly. It used to take
+        // the full stack width, and a square that wide is taller than a presentation which is
+        // wider than it is tall — an iPad page sheet — so the content overflowed a frame it had
+        // no constraint against and the instructions and "Done" were clipped off either end
+        // (#141). Now it fills the width only until it hits its generated size or the height
+        // the sheet can actually show.
+        let qrContainer = UIView()
+        qrContainer.addSubview(imageView)
+        let qrFillsWidth = imageView.widthAnchor.constraint(equalTo: qrContainer.widthAnchor)
+        qrFillsWidth.priority = .defaultHigh
 
         let passwordLabel = UILabel()
         passwordLabel.text = password
@@ -198,19 +210,59 @@ class QRDisplayViewController: UIViewController {
         doneButton.setTitle("Done", for: .normal)
         doneButton.titleLabel?.font = .systemFont(ofSize: 18)
         doneButton.addTarget(self, action: #selector(dismissSelf), for: .touchUpInside)
+        doneButton.translatesAutoresizingMaskIntoConstraints = false
 
-        let stack = UIStackView(arrangedSubviews: [instructions, imageView, passwordLabel, doneButton])
+        let stack = UIStackView(arrangedSubviews: [instructions, qrContainer, passwordLabel])
         stack.axis = .vertical
         stack.spacing = 24
         stack.alignment = .fill
         stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+
+        // Everything above "Done" scrolls, so no combination of screen size, orientation and
+        // text size can clip it. "Done" is outside the scroll view, so it is always on screen
+        // and never needs to be scrolled to.
+        let scrollView = UIScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.addSubview(stack)
+        view.addSubview(scrollView)
+        view.addSubview(doneButton)
+
+        let safeArea = view.safeAreaLayoutGuide
+        let content = scrollView.contentLayoutGuide
+        let visible = scrollView.frameLayoutGuide
+
+        // Shrink the code rather than making the user scroll to see all of it, until that would
+        // leave too little room for the text around it.
+        let qrFitsHeight = imageView.heightAnchor.constraint(
+            lessThanOrEqualTo: visible.heightAnchor, multiplier: 0.55
+        )
 
         NSLayoutConstraint.activate([
-            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            stack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 32),
-            stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -32),
+            scrollView.topAnchor.constraint(equalTo: safeArea.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: safeArea.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: safeArea.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: doneButton.topAnchor, constant: -16),
+
+            doneButton.centerXAnchor.constraint(equalTo: safeArea.centerXAnchor),
+            doneButton.bottomAnchor.constraint(equalTo: safeArea.bottomAnchor, constant: -16),
+            doneButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 32),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -32),
+            // ties the scrollable width to the visible width, so it only ever scrolls vertically
+            stack.widthAnchor.constraint(equalTo: visible.widthAnchor, constant: -64),
+
+            imageView.topAnchor.constraint(equalTo: qrContainer.topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: qrContainer.bottomAnchor),
+            imageView.centerXAnchor.constraint(equalTo: qrContainer.centerXAnchor),
             imageView.heightAnchor.constraint(equalTo: imageView.widthAnchor),
+            imageView.widthAnchor.constraint(lessThanOrEqualTo: qrContainer.widthAnchor),
+            // no larger than the image qrCodeImage actually generated
+            imageView.widthAnchor.constraint(lessThanOrEqualToConstant: 480),
+            qrFillsWidth,
+            qrFitsHeight,
         ])
     }
 
