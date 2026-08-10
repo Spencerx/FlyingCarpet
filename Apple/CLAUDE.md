@@ -46,10 +46,32 @@ your team once in Xcode (target → Signing & Capabilities → Team; Xcode write
 xcodebuild ... DEVELOPMENT_TEAM=YOURTEAMID -allowProvisioningUpdates build
 ```
 
-**The tests live in the macOS target.** `macOS/FlyingCarpetTests/FlyingCarpetTests.swift` holds
-all 23 of them, including the cross-platform Noise and discovery known-answer vectors.
-`iOS/FlyingCarpetTests/` is a 36-line stub — don't go looking for the KATs there, and run the
-macOS test target when changing protocol code.
+**The protocol tests live in the macOS target.** `macOS/FlyingCarpetTests/FlyingCarpetTests.swift`
+holds 25 of them, including the cross-platform Noise and discovery known-answer vectors. Run that
+target when changing protocol code — the KATs are not duplicated in the iOS target.
+
+`iOS/FlyingCarpetTests/FlyingCarpetTests.swift` holds the 8 tests that can only be exercised on
+iOS: the bounded Noise receive buffer (#142) on the platform whose receiver actually failed, and
+the QR display layout (#141), which is UIKit and has no macOS counterpart. Run it against a
+simulator:
+
+```
+xcodebuild -project iOS/FlyingCarpet.xcodeproj -scheme FlyingCarpet \
+  -destination 'platform=iOS Simulator,name=iPad Pro 13-inch (M4)' \
+  -only-testing:FlyingCarpetTests test
+```
+
+Two things to know before running either:
+
+- **`-only-testing:FlyingCarpetTests`.** Without it the scheme also runs `FlyingCarpetUITests`,
+  which is untouched Xcode boilerplate that asserts nothing. On macOS it builds and launches a
+  separate `FlyingCarpetUITests-Runner.app`, which prompts for automation permission and re-prompts
+  on every rebuild, because an ad-hoc-signed bundle gets a new signature each time.
+- **A team on the app target alone breaks the macOS test bundle.** Selecting your team in Xcode
+  writes `DEVELOPMENT_TEAM` into the app target's configs only, and the test bundle then fails to
+  load into its host with *"mapping process and mapped file (non-platform) have different Team
+  IDs"*. Pass `DEVELOPMENT_TEAM=YOURTEAMID` to `xcodebuild` so every target agrees. Simulator runs
+  are unaffected.
 
 **SourceKit lies about single files.** Diagnostics that lint one file in isolation report bogus
 "Cannot find type 'Transfer'/'Bluetooth' in scope" and "No such module 'UIKit'" errors — the

@@ -569,7 +569,9 @@ final class NoiseConnectionBufferTests: XCTestCase {
         // proportional to the volume streamed is not.
         XCTAssertLessThan(
             growth, 64 << 20,
-            "footprint grew \(growth >> 20) MB while streaming \(CHUNK_SIZE * chunks >> 20) MB"
+            // parenthesised: >> binds tighter than * in Swift, so the unparenthesised form
+            // reports "0 MB" for any transfer under 1 MiB * chunks
+            "footprint grew \(growth >> 20) MB while streaming \((CHUNK_SIZE * chunks) >> 20) MB"
         )
     }
 }
