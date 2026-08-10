@@ -508,18 +508,38 @@ class MainViewModel(private val application: Application) : AndroidViewModel(app
         return (1..10).map { chars[random.nextInt(chars.length)] }.joinToString("")
     }
 
-    // Retries for up to 30 seconds (matches the desktop and Apple implementations): the
-    // receiver may still be finishing discovery when we start connecting.
-    private suspend fun connectToSharedNetworkPeer() {
-        outputText("Connecting to receiver at ${peerIP?.hostAddress}:$PORT...")
+    // Connects to peerIP, retrying for up to 30 seconds (matches the desktop and Apple
+    // implementations). Both connect paths need this and for overlapping reasons.
+    //
+    // Shared network: the receiver may still be finishing discovery when we start connecting.
+    //
+    // Hotspot: joinHotspot() starts the transfer from onLinkPropertiesChanged, and the
+    // network's IPv4 route is not necessarily in the kernel the instant those properties
+    // arrive — nor is bindProcessToNetwork guaranteed to have taken effect. That path used to
+    // get exactly one attempt, so a few milliseconds of skew failed the whole transfer with
+    // ENETUNREACH (a local "no route" error, so nothing reached the host) while the host sat
+    // waiting for a connection that was never sent. See #130.
+    private suspend fun connectToPeerWithRetry(peerDescription: String) {
+        // Guarded here rather than at the call sites: onLinkPropertiesChanged launches the
+        // transfer whether or not it managed to resolve an address, so this is where a missing
+        // one has to produce something the user can act on.
+        val target = peerIP
+            ?: throw Exception(
+                "Never learned the other device's address on this network. "
+                        + "Start the transfer again, or use Shared Network mode."
+            )
+        outputText("Connecting to $peerDescription at ${target.hostAddress}:$PORT...")
         val deadline = System.currentTimeMillis() + 30_000
         var attempt = 0
         while (true) {
             attempt++
             try {
                 val socket = Socket()
-                socket.connect(InetSocketAddress(peerIP, PORT), 5000)
+                socket.connect(InetSocketAddress(target, PORT), 5000)
                 client = socket
+                if (attempt > 1) {
+                    outputText("Connected on attempt $attempt.")
+                }
                 return
             } catch (e: Exception) {
                 if (System.currentTimeMillis() >= deadline) {
@@ -751,14 +771,14 @@ class MainViewModel(private val application: Application) : AndroidViewModel(app
                     peerIP = client.inetAddress as? Inet4Address
                     outputText("TCP connection accepted")
                 } else {
-                    connectToSharedNetworkPeer()
+                    connectToPeerWithRetry("receiver")
                     outputText("TCP connection established")
                 }
             } else if (isHosting()) {
                 server = ServerSocket(PORT)
                 client = server.accept()
             } else {
-                client = Socket(peerIP, 3290)
+                connectToPeerWithRetry("the other device")
             }
             // The send loop writes an 8-byte chunk length and then the chunk body, so the
             // length reaches the wire as its own small segment. Nagle holds a sub-MSS
@@ -927,7 +947,13 @@ class MainViewModel(private val application: Application) : AndroidViewModel(app
         lateinit var connectivityManager: ConnectivityManager
         override fun onAvailable(network: Network) {
             super.onAvailable(network)
-            connectivityManager.bindProcessToNetwork(network)
+            // The return value matters: on false the process keeps whatever default network
+            // it had (often cellular), where the hotspot's address has no route at all and
+            // every connect fails immediately. Silently ignoring it made that indistinguishable
+            // from the route simply not being ready yet (#130).
+            if (!connectivityManager.bindProcessToNetwork(network)) {
+                outputText("Warning: couldn't route this app's traffic over the hotspot. If the transfer fails, start it again.")
+            }
         }
 
         override fun onLost(network: Network) {
